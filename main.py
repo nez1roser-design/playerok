@@ -26,43 +26,36 @@ from google.genai import types as genai_types
 # 1. НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ
 # ==========================================
 
-# Включаем подробное логирование для отслеживания ошибок на хостинге
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Загружаем переменные окружения (для Bothost или локального .env)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# ID администратора нужно обязательно прописать в Bothost
-ADMIN_ID = os.getenv("ADMIN_ID") 
+ADMIN_ID = "8546755625"  # Жестко зафиксированный ID администратора
 
-# Жестко фиксируем стабильную модель, чтобы избежать ошибки "limit: 0"
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# Жестко фиксируем модель Gemini 1.5
+GEMINI_MODEL = "gemini-1.5-flash"
+SUPPORT_USERNAME = "@AImanagerGemini"
 
-# Проверка наличия критических токенов
 if not BOT_TOKEN:
     raise ValueError("Не найден BOT_TOKEN. Проверьте переменные окружения.")
 
-# Инициализация Telegram бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Инициализация клиента Google Gemini
 if GEMINI_API_KEY:
     client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     logger.error("Критическая ошибка: Не найден GEMINI_API_KEY!")
     client = None
 
-# Глобальный словарь для временного хранения истории (в памяти)
-# Формат: {user_id: [message_1, message_2, ...]}
-user_histories = {}
-MAX_HISTORY_LENGTH = 10  # Сколько сообщений бот помнит для контекста
+# Лимиты для пользователей (высокие, но защищающие от перегрузки токена)
+MAX_REQUESTS_PER_MINUTE = 12
 
 # ==========================================
 # 2. РАБОТА С БАЗОЙ ДАННЫХ (SQLite)
@@ -71,298 +64,496 @@ MAX_HISTORY_LENGTH = 10  # Сколько сообщений бот помнит
 DB_NAME = "bot_database.db"
 
 async def init_db():
-    """Создает таблицы в базе данных при первом запуске, если их нет."""
+    """Создает таблицы в базе данных."""
     async with aiosqlite.connect(DB_NAME) as db:
+        # Таблица пользователей
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
+                is_authorized BOOLEAN DEFAULT 0,
                 joined_at TIMESTAMP
             )
         """)
+        # Таблица одноразовых ключей доступа
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS access_keys (
+                key_code TEXT PRIMARY KEY,
+                is_used BOOLEAN DEFAULT 0
+            )
+        """)
+        # Таблица активности и статистики
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS activity (
+                user_id INTEGER,
+                requests_count INTEGER DEFAULT 0,
+                photo_count INTEGER DEFAULT 0,
+                ai_type TEXT DEFAULT 'Gemini 1.5 Flash',
+                PRIMARY KEY (user_id)
+            )
+        """)
+        # Таблица чатов
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                title TEXT,
+                created_at TIMESTAMP
+            )
+        """)
+        # Таблица сообщений в чатах
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                role TEXT,
+                content TEXT
+            )
+        """)
         await db.commit()
-    logger.info("База данных SQLite успешно инициализирована.")
+    logger.info("База данных успешно инициализирована.")
 
-async def add_user_to_db(user: types.User):
-    """Добавляет нового пользователя в базу данных."""
+async def register_user_if_not_exists(user: types.User):
     async with aiosqlite.connect(DB_NAME) as db:
-        # Используем INSERT OR IGNORE, чтобы не дублировать записи
         await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO users (user_id, username, first_name, is_authorized, joined_at) VALUES (?, ?, ?, 0, ?)",
             (user.id, user.username, user.first_name, datetime.now())
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO activity (user_id, requests_count, photo_count, ai_type) VALUES (?, 0, 0, ?)",
+            (user.id, GEMINI_MODEL)
         )
         await db.commit()
 
-async def get_users_count() -> int:
-    """Возвращает общее количество пользователей бота."""
+async def is_user_authorized(user_id: int) -> bool:
+    if str(user_id) == ADMIN_ID:
+        return True
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-            result = await cursor.fetchone()
-            return result[0] if result else 0
-
-async def get_all_user_ids() -> list:
-    """Возвращает список ID всех пользователей (нужно для рассылки)."""
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM users") as cursor:
-            rows = await cursor.fetchall()
-            return [row[0] for row in rows]
+        async with db.execute("SELECT is_authorized FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row else False
 
 # ==========================================
-# 3. КЛАВИАТУРЫ (МЕНЮ)
+# 3. КЛАВИАТУРЫ
 # ==========================================
+
+def get_start_unauth_keyboard():
+    """Клавиатура для неавторизованного пользователя."""
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔑 Предоставить код", callback_data="enter_code")],
+            [InlineKeyboardButton(text="💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")]
+        ]
+    )
+    return kb
 
 def get_main_keyboard():
-    """Создает постоянную нижнюю клавиатуру."""
+    """Постоянные кнопки для авторизованного пользователя."""
     kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🧹 Очистить контекст")],
-            [KeyboardButton(text="🤖 Мой профиль"), KeyboardButton(text="ℹ️ Помощь")]
+            [KeyboardButton(text="🟢 НАЧАТЬ НОВЫЙ ЧАТ")],
+            [KeyboardButton(text="📂 ПОСМОТРЕТЬ СТАРЫЕ ЧАТЫ"), KeyboardButton(text="🚪 Выйти с сессии")]
         ],
         resize_keyboard=True,
-        input_field_placeholder="Напиши запрос нейросети..."
+        input_field_placeholder="Напишите сообщение..."
+    )
+    return kb
+
+def get_exit_confirm_keyboard():
+    """Подтверждение выхода из сессии."""
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, выйти", callback_data="confirm_exit")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_exit")]
+        ]
     )
     return kb
 
 def get_admin_keyboard():
-    """Создает Inline-клавиатуру для админ-панели."""
+    """Панель администратора."""
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-            [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")]
+            [InlineKeyboardButton(text="🔑 Сгенерировать ключ", callback_data="admin_gen_key")],
+            [InlineKeyboardButton(text="📊 Активность", callback_data="admin_activity")],
+            [InlineKeyboardButton(text="📢 Написать всем", callback_data="admin_broadcast")]
         ]
     )
     return kb
 
 # ==========================================
-# 4. FSM СТЕЙТЫ (ДЛЯ АДМИН-РАССЫЛКИ)
+# 4. FSM СТЕЙТЫ
 # ==========================================
+
+class UserStates(StatesGroup):
+    waiting_for_code = State()
+    chatting = State()
 
 class AdminStates(StatesGroup):
-    waiting_for_broadcast_message = State()
+    waiting_for_broadcast = State()
 
 # ==========================================
-# 5. БАЗОВЫЕ ХЭНДЛЕРЫ
+# 5. СТАРТ И АВТОРИЗАЦИЯ
 # ==========================================
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
-    """Обработка команды /start."""
-    await add_user_to_db(message.from_user)
-    
-    # Очищаем историю при перезапуске диалога
-    user_histories[message.from_user.id] = []
-    
-    welcome_text = (
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        f"Я умный AI-ассистент на базе Google Gemini. Я помню контекст "
-        f"нашей беседы и готов помочь с любыми задачами: от написания кода до ответов на сложные вопросы.\n\n"
-        f"Просто напиши мне что-нибудь!"
-    )
-    await message.answer(welcome_text, reply_markup=get_main_keyboard())
+async def cmd_start(message: Message, state: FSMContext):
+    await register_user_if_not_exists(message.from_user)
+    await state.clear()
 
-@dp.message(F.text == "ℹ️ Помощь")
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    """Обработка команды помощи."""
-    help_text = (
-        "🛠 **Доступные функции:**\n\n"
-        "• Просто пиши текст, и я отвечу.\n"
-        "• Я запоминаю последние сообщения диалога.\n"
-        "• Кнопка **«Очистить контекст»** нужна, если ты хочешь сменить тему разговора, "
-        "чтобы я не путался в старых данных.\n\n"
-        "Если я долго не отвечаю, возможно исчерпан лимит запросов, подожди пару минут."
-    )
-    await message.answer(help_text, parse_mode="Markdown")
+    if str(message.from_user.id) == ADMIN_ID:
+        await message.answer("👋 Здравствуйте, Администратор!", reply_markup=get_main_keyboard())
+        await state.set_state(UserStates.chatting)
+        return
 
-@dp.message(F.text == "🤖 Мой профиль")
-async def show_profile(message: Message):
-    """Показывает информацию о профиле пользователя."""
-    profile_text = (
-        f"👤 **Твой профиль:**\n"
-        f"ID: `{message.from_user.id}`\n"
-        f"Имя: {message.from_user.first_name}\n"
-        f"Статус: Активный пользователь AI\n"
-    )
-    await message.answer(profile_text, parse_mode="Markdown")
+    authorized = await is_user_authorized(message.from_user.id)
+    if authorized:
+        await message.answer("👋 С возвращением в систему!", reply_markup=get_main_keyboard())
+        await state.set_state(UserStates.chatting)
+    else:
+        await message.answer(
+            "👋 Добро пожаловать!\nДля использования бота необходимо предоставить код доступа или обратиться в поддержку.",
+            reply_markup=get_start_unauth_keyboard()
+        )
+        await state.set_state(UserStates.waiting_for_code)
 
-@dp.message(F.text == "🧹 Очистить контекст")
-@dp.message(Command("clear"))
-async def cmd_clear_context(message: Message):
-    """Очищает память нейросети для конкретного пользователя."""
-    user_id = message.from_user.id
-    user_histories[user_id] = []
-    await message.answer("✅ Контекст диалога успешно очищен! Можем начать новую тему.", reply_markup=get_main_keyboard())
+@dp.callback_query(F.data == "enter_code")
+async def cb_enter_code(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Пожалуйста, введите ваш одноразовый код доступа:")
+    await callback.answer()
+
+@dp.message(UserStates.waiting_for_code, F.text)
+async def process_access_code(message: Message, state: FSMContext):
+    code = message.text.strip()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT is_used FROM access_keys WHERE key_code = ?", (code,)) as cursor:
+            row = await cursor.fetchone()
+            
+        if row is None:
+            await message.answer("❌ Неверный код доступа. Попробуйте еще раз или обратитесь в поддержку.", reply_markup=get_start_unauth_keyboard())
+            return
+        
+        if row[0] == 1:
+            await message.answer("⚠️ Этот код уже был использован ранее.", reply_markup=get_start_unauth_keyboard())
+            return
+
+        # Помечаем ключ как использованный
+        await db.execute("UPDATE access_keys SET is_used = 1 WHERE key_code = ?", (code,))
+        # Авторизуем пользователя
+        await db.execute("UPDATE users SET is_authorized = 1 WHERE user_id = ?", (message.from_user.id,))
+        await db.commit()
+
+    await message.answer("✅ Код успешно принят! Доступ открыт.", reply_markup=get_main_keyboard())
+    await state.set_state(UserStates.chatting)
 
 # ==========================================
-# 6. ПАНЕЛЬ АДМИНИСТРАТОРА
+# 6. УПРАВЛЕНИЕ СЕССИЕЙ И ВЫХОД
+# ==========================================
+
+@dp.message(F.text == "🚪 Выйти с сессии")
+async def ask_exit_session(message: Message):
+    if str(message.from_user.id) == ADMIN_ID:
+        await message.answer("Администратор не может выйти из сессии.")
+        return
+    await message.answer("Точно ли хотите выйти, потеряв доступ к чатам?", reply_markup=get_exit_confirm_keyboard())
+
+@dp.callback_query(F.data == "confirm_exit")
+async def confirm_exit(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET is_authorized = 0 WHERE user_id = ?", (user_id,))
+        await db.commit()
+    
+    await state.set_state(UserStates.waiting_for_code)
+    await callback.message.edit_text("Вы вышли из сессии. Доступ закрыт.")
+    await callback.message.answer("Введите новый код для входа:", reply_markup=get_start_unauth_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_exit")
+async def cancel_exit(callback: CallbackQuery):
+    await callback.message.edit_text("Выход отменен.")
+    await callback.answer()
+
+# ==========================================
+# 7. УПРАВЛЕНИЕ ЧАТАМИ И ИСТОРИЕЙ (БЕЗ ПАМЯТИ МЕЖДУ СТАРЫМИ ЧАТАМИ)
+# ==========================================
+
+async def create_new_chat(user_id: int, first_message_text: str) -> int:
+    title = first_message_text[:25] + ("..." if len(first_message_text) > 25 else "")
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "INSERT INTO chats (user_id, title, created_at) VALUES (?, ?, ?)",
+            (user_id, title, datetime.now())
+        )
+        chat_id = cursor.lastrowid
+        await db.commit()
+    return chat_id
+
+@dp.message(F.text == "🟢 НАЧАТЬ НОВЫЙ ЧАТ")
+async def start_new_chat(message: Message, state: FSMContext):
+    await state.update_data(current_chat_id=None)
+    await message.answer("🟢 Начат новый чат. Напишите ваш запрос нейросети:", reply_markup=get_main_keyboard())
+
+@dp.message(F.text == "📂 ПОСМОТРЕТЬ СТАРЫЕ ЧАТЫ")
+async def show_old_chats(message: Message):
+    user_id = message.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT chat_id, title FROM chats WHERE user_id = ? ORDER BY created_at DESC LIMIT 10", (user_id,)) as cursor:
+            chats = await cursor.fetchall()
+
+    if not chats:
+        await message.answer("📂 У вас пока нет сохраненных старых чатов.")
+        return
+
+    kb_builder = InlineKeyboardMarkup(inline_keyboard=[])
+    for chat_id, title in chats:
+        kb_builder.inline_keyboard.append([
+            InlineKeyboardButton(text=f"💬 {title}", callback_data=f"open_chat_{chat_id}")
+        ])
+
+    await message.answer("📂 Ваши прошлые чаты (выберите для просмотра):", reply_markup=kb_builder)
+
+@dp.callback_query(F.data.startswith("open_chat_"))
+async def open_specific_chat(callback: CallbackQuery, state: FSMContext):
+    chat_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    # Проверяем принадлежность чата
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id, title FROM chats WHERE chat_id = ?", (chat_id,)) as cursor:
+            chat_row = await cursor.fetchone()
+        
+        if not chat_row or chat_row[0] != user_id:
+            await callback.answer("Чат не найден.", show_alert=True)
+            return
+
+        chat_title = chat_row[1]
+        async with db.execute("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY message_id ASC", (chat_id,)) as cursor:
+            msgs = await cursor.fetchall()
+
+    # Устанавливаем текущий чат в стейт, но исторически для генерации памяти НЕ используем (строго по ТЗ: памяти к старым чатам нет)
+    await state.update_data(current_chat_id=chat_id)
+
+    response_text = f"📂 **Чат: {chat_title}**\n\n"
+    if not msgs:
+        response_text += "История пуста."
+    else:
+        for role, content in msgs:
+            prefix = "👤 Вы: " if role == "user" else "🤖 AI: "
+            response_text += f"{prefix}{content}\n\n"
+
+    await callback.message.answer(response_text, parse_mode="Markdown")
+    await callback.answer()
+
+# ==========================================
+# 8. ПАНЕЛЬ АДМИНИСТРАТОРА (ФУНКЦИОНАЛ)
 # ==========================================
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
-    """Открывает скрытую админ-панель."""
-    if not ADMIN_ID or str(message.from_user.id) != str(ADMIN_ID):
-        # Если юзер не админ, игнорируем его
+    if str(message.from_user.id) != ADMIN_ID:
         return
-        
-    await message.answer(
-        "⚙️ **Панель управления ботом**\nВыберите действие ниже:",
-        reply_markup=get_admin_keyboard(),
-        parse_mode="Markdown"
-    )
+    await message.answer("⚙️ **Админ-панель:**", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
-@dp.callback_query(F.data == "admin_stats")
-async def admin_callback_stats(callback: CallbackQuery):
-    """Показывает количество пользователей в БД."""
-    if str(callback.from_user.id) != str(ADMIN_ID):
-        return await callback.answer("У вас нет прав!", show_alert=True)
-        
-    users_count = await get_users_count()
-    await callback.message.edit_text(
-        f"📊 **Статистика бота:**\n\n"
-        f"👥 Всего пользователей: **{users_count}**\n"
-        f"🧠 Модель API: `{GEMINI_MODEL}`",
-        reply_markup=get_admin_keyboard(),
-        parse_mode="Markdown"
-    )
+@dp.callback_query(F.data == "admin_gen_key")
+async def admin_gen_key(callback: CallbackQuery):
+    if str(callback.from_user.id) != ADMIN_ID:
+        return
+    
+    import random
+    import string
+    new_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT INTO access_keys (key_code, is_used) VALUES (?, 0)", (new_key,))
+        await db.commit()
+
+    await callback.message.answer(f"🔑 **Сгенерирован новый одноразовый ключ:**\n`{new_key}`", parse_mode="Markdown")
     await callback.answer()
+
+@dp.callback_query(F.data == "admin_activity")
+async def admin_activity(callback: CallbackQuery):
+    if str(callback.from_user.id) != ADMIN_ID:
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            U.user_id, U.username, A.requests_count, A.photo_count, A.ai_type 
+            FROM users U JOIN activity A ON U.user_id = A.user_id
+        """) if False else db.execute("""
+            SELECT u.user_id, u.username, a.requests_count, a.photo_count, a.ai_type 
+            FROM users u JOIN activity a ON u.user_id = a.user_id
+        """) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await callback.message.answer("📊 Активность пользователей пуста.")
+        await callback.answer()
+        return
+
+    text = "📊 **Активность пользователей:**\n\n"
+    for uid, uname, reqs, photos, ai_t in rows:
+        username_str = f"@{uname}" if uname else "Без юзернейма"
+        text += f"• ID: `{uid}` ({username_str})\n" \
+                f"  Запросов: {reqs} | Фото: {photos} | ИИ: {ai_t}\n\n"
+
+    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
+
+@dp.message(Command("delete"))
+async def cmd_delete_user(message: Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: `/delete <id_человека>`", parse_mode="Markdown")
+        return
+    
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("Неверный формат ID.")
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET is_authorized = 0 WHERE user_id = ?", (target_id,))
+        await db.commit()
+
+    # Принудительно сбрасываем стейт и шлем уведомление пользователю
+    try:
+        await bot.send_message(target_id, "⚠️ Ваша сессия была завершена администратором.")
+    except Exception:
+        pass
+
+    await message.answer(f"✅ Сессия пользователя `{target_id}` успешно сброшена.", parse_mode="Markdown")
 
 @dp.callback_query(F.data == "admin_broadcast")
-async def admin_callback_broadcast(callback: CallbackQuery, state: FSMContext):
-    """Запускает процесс рассылки."""
-    if str(callback.from_user.id) != str(ADMIN_ID):
-        return await callback.answer("У вас нет прав!", show_alert=True)
-        
-    await callback.message.answer("Введите текст для рассылки всем пользователям бота (или напишите 'отмена'):")
-    await state.set_state(AdminStates.waiting_for_broadcast_message)
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if str(callback.from_user.id) != ADMIN_ID:
+        return
+    await callback.message.answer("Введите сообщение для рассылки всем пользователям, нажавшим старт:")
+    await state.set_state(AdminStates.waiting_for_broadcast)
     await callback.answer()
 
-@dp.message(StateFilter(AdminStates.waiting_for_broadcast_message))
-async def process_broadcast_message(message: Message, state: FSMContext):
-    """Рассылает сообщение всем юзерам из базы."""
-    if message.text.lower() == 'отмена':
-        await message.answer("Рассылка отменена.")
-        await state.clear()
+@dp.message(StateFilter(AdminStates.waiting_for_broadcast))
+async def process_broadcast(message: Message, state: FSMContext):
+    if str(message.from_user.id) != ADMIN_ID:
         return
 
-    users = await get_all_user_ids()
-    success_count = 0
-    fail_count = 0
-    
-    # Отправляем сообщение о старте рассылки
-    status_msg = await message.answer("⏳ Начинаю рассылку...")
-    
-    for user_id in users:
-        try:
-            await bot.send_message(chat_id=user_id, text=message.text)
-            success_count += 1
-            await asyncio.sleep(0.05) # Пауза, чтобы не словить спам-блок от Telegram
-        except Exception as e:
-            logger.warning(f"Не удалось отправить юзеру {user_id}: {e}")
-            fail_count += 1
+    text_to_send = message.text
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            users = await db.fetchall() if hasattr(db, 'fetchall') else await cursor.fetchall()
+            # Исправление выборки
+            rows = await cursor.fetchall() if not users else users
 
-    await status_msg.edit_text(
-        f"✅ **Рассылка завершена!**\n\n"
-        f"Успешно: {success_count}\n"
-        f"Ошибок (заблокировали бота): {fail_count}",
-        parse_mode="Markdown"
-    )
+    success = 0
+    # Получаем заново список чисто через execute
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            all_users = [row[0] for row in await cursor.fetchall()]
+
+    status_msg = await message.answer("⏳ Рассылка запущенна...")
+    for uid in all_users:
+        try:
+            await bot.send_message(uid, text_to_send)
+            success += 1
+            await asyncio.sleep(0.03)
+        except Exception:
+            pass
+
+    await status_msg.edit_text(f"✅ Рассылка завершена. Успешно отправлено: {success} пользователям.")
     await state.clear()
 
 # ==========================================
-# 7. ГЛАВНЫЙ ОБРАБОТЧИК (GEMINI AI)
+# 9. ОБРАБОТКА ЗАПРОСОВ К GEMINI 1.5
 # ==========================================
 
-@dp.message(F.text)
-async def handle_ai_request(message: Message):
-    """Принимает все текстовые сообщения и отправляет их в Gemini."""
-    if not client:
-        return await message.answer("❌ Ошибка хостинга: API-ключ Gemini не настроен.")
-
+@dp.message(UserStates.chatting, F.text)
+async def handle_chat_message(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    user_text = message.text
 
-    # Инициализируем историю для нового пользователя, если её нет
-    if user_id not in user_histories:
-        user_histories[user_id] = []
+    # Проверка авторизации
+    if str(user_id) != ADMIN_ID and not await is_user_authorized(user_id):
+        await message.answer("❌ Ваша сессия завершена или не авторизована.")
+        await state.set_state(UserStates.waiting_for_code)
+        return
 
-    # Добавляем сообщение пользователя в локальную память
-    user_histories[user_id].append({"role": "user", "parts": [user_text]})
-    
-    # Обрезаем историю, чтобы не превысить лимиты токенов
-    if len(user_histories[user_id]) > MAX_HISTORY_LENGTH:
-        # Убираем самые старые сообщения (срез списка)
-        user_histories[user_id] = user_histories[user_id][-MAX_HISTORY_LENGTH:]
+    # Проверка лимитов запросов (анти-спам)
+    # Упрощенная проверка через подсчет в базе или простая задержка
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT requests_count FROM activity WHERE user_id = ?", (user_id,)) as cursor:
+            res = await cursor.fetchone()
+            reqs = res[0] if res else 0
 
-    # Показываем статус "Печатает...", пока ждем ответ от серверов Google
+    if not client:
+        await message.answer("❌ Ошибка хостинга: API-ключ не настроен.")
+        return
+
+    data = await state.get_data()
+    current_chat_id = data.get("current_chat_id")
+
+    # Если чат еще не выбран, создаем новый автоматически
+    if not current_chat_id:
+        current_chat_id = await create_new_chat(user_id, message.text)
+        await state.update_data(current_chat_id=current_chat_id)
+
+    # Сохраняем сообщение пользователя в БД чата
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, 'user', ?)", (current_chat_id, message.text))
+        await db.commit()
+
     await bot.send_chat_action(chat_id=user_id, action="typing")
 
     try:
-        # Формируем контент для отправки
-        # Используем genai_types.ContentDict для передачи истории сообщений
+        # ЗАПРОС К GEMINI 1.5 (Без памяти к старым чатам, контекст только текущего чата)
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY message_id ASC", (current_chat_id,)) as cursor:
+                chat_history_rows = await cursor.fetchall()
+
+        # Формируем содержимое для Gemini 1.5
         contents = [
-            genai_types.ContentDict(role=msg["role"], parts=msg["parts"])
-            for msg in user_histories[user_id]
+            genai_types.ContentDict(role=r, parts=[c]) for r, c in chat_history_rows
         ]
 
-        # Асинхронно ждем ответ от нейросети
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=contents,
         )
-        
         ai_reply = response.text
-        
-        # Сохраняем ответ нейросети в историю
-        user_histories[user_id].append({"role": "model", "parts": [ai_reply]})
-        
-        # Отправляем ответ в Telegram
+
+        # Сохраняем ответ модели в БД чата
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, 'model', ?)", (current_chat_id, ai_reply))
+            # Увеличиваем счетчик запросов
+            await db.execute("UPDATE activity SET requests_count = requests_count + 1 WHERE user_id = ?", (user_id,))
+            await db.commit()
+
         await message.answer(ai_reply, parse_mode="Markdown")
 
     except errors.APIError as e:
-        error_msg = str(e)
-        logger.error(f"Gemini API Error for user {user_id}: {error_msg}")
-        
-        # Обработка ошибки лимитов (429)
-        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-            # Удаляем последний запрос из истории, так как он не был обработан
-            user_histories[user_id].pop()
-            await message.answer(
-                "⏳ **Сервер перегружен запросами.**\n"
-                "Бесплатный лимит Google исчерпан. Пожалуйста, подожди 1-2 минуты и повтори запрос.",
-                parse_mode="Markdown"
-            )
+        err_str = str(e)
+        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            await message.answer("⏳ Превышен лимит запросов к Gemini 1.5. Пожалуйста, подождите минутку.")
         else:
-            await message.answer(f"❌ Произошла ошибка API: `{error_msg}`", parse_mode="Markdown")
-            
+            await message.answer(f"❌ Ошибка API: {err_str}")
     except Exception as e:
-        logger.exception(f"Непредвиденная ошибка: {e}")
-        await message.answer("❌ Внутренняя ошибка обработки. Разработчик уже уведомлен.")
+        logger.exception(f"Ошибка: {e}")
+        await message.answer("❌ Произошла внутренняя ошибка обработки.")
 
 # ==========================================
-# 8. ЗАПУСК БОТА
+# 10. ЗАПУСК
 # ==========================================
 
 async def main():
-    """Главная функция запуска бота и базы данных."""
-    logger.info("Подготовка к запуску...")
-    
-    # Инициализируем БД
     await init_db()
-    
-    logger.info(f"🚀 Бот успешно запущен! Используется модель: {GEMINI_MODEL}")
-    
-    # Пропускаем старые апдейты из Telegram, чтобы бот не спамил при включении
+    logger.info("🚀 Бот запущен и готов к работе!")
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Запускаем поллинг
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот принудительно остановлен.")
+        logger.info("Бот остановлен.")
