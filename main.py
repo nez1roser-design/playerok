@@ -20,7 +20,6 @@ from aiogram.fsm.state import State, StatesGroup
 
 from google import genai
 from google.genai import errors
-from google.genai import types as genai_types
 
 # ==========================================
 # 1. НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ
@@ -38,7 +37,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_ID = "8546755625"  # Жестко зафиксированный ID администратора
 
-# Жестко фиксируем модель Gemini 1.5
 GEMINI_MODEL = "gemini-1.5-flash"
 SUPPORT_USERNAME = "@AImanagerGemini"
 
@@ -54,9 +52,6 @@ else:
     logger.error("Критическая ошибка: Не найден GEMINI_API_KEY!")
     client = None
 
-# Лимиты для пользователей (высокие, но защищающие от перегрузки токена)
-MAX_REQUESTS_PER_MINUTE = 12
-
 # ==========================================
 # 2. РАБОТА С БАЗОЙ ДАННЫХ (SQLite)
 # ==========================================
@@ -64,9 +59,7 @@ MAX_REQUESTS_PER_MINUTE = 12
 DB_NAME = "bot_database.db"
 
 async def init_db():
-    """Создает таблицы в базе данных."""
     async with aiosqlite.connect(DB_NAME) as db:
-        # Таблица пользователей
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -76,14 +69,12 @@ async def init_db():
                 joined_at TIMESTAMP
             )
         """)
-        # Таблица одноразовых ключей доступа
         await db.execute("""
             CREATE TABLE IF NOT EXISTS access_keys (
                 key_code TEXT PRIMARY KEY,
                 is_used BOOLEAN DEFAULT 0
             )
         """)
-        # Таблица активности и статистики
         await db.execute("""
             CREATE TABLE IF NOT EXISTS activity (
                 user_id INTEGER,
@@ -93,7 +84,6 @@ async def init_db():
                 PRIMARY KEY (user_id)
             )
         """)
-        # Таблица чатов
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +92,6 @@ async def init_db():
                 created_at TIMESTAMP
             )
         """)
-        # Таблица сообщений в чатах
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 message_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,7 +128,6 @@ async def is_user_authorized(user_id: int) -> bool:
 # ==========================================
 
 def get_start_unauth_keyboard():
-    """Клавиатура для неавторизованного пользователя."""
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔑 Предоставить код", callback_data="enter_code")],
@@ -149,7 +137,6 @@ def get_start_unauth_keyboard():
     return kb
 
 def get_main_keyboard():
-    """Постоянные кнопки для авторизованного пользователя."""
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🟢 НАЧАТЬ НОВЫЙ ЧАТ")],
@@ -161,7 +148,6 @@ def get_main_keyboard():
     return kb
 
 def get_exit_confirm_keyboard():
-    """Подтверждение выхода из сессии."""
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Да, выйти", callback_data="confirm_exit")],
@@ -171,7 +157,6 @@ def get_exit_confirm_keyboard():
     return kb
 
 def get_admin_keyboard():
-    """Панель администратора."""
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔑 Сгенерировать ключ", callback_data="admin_gen_key")],
@@ -212,7 +197,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.set_state(UserStates.chatting)
     else:
         await message.answer(
-            "👋 Добро пожаловать!\nДля использования бота необходимо предоставить код доступа или обратиться в поддержку.",
+            "👋 Добро пожаловать!\nПожалуйста, предоставьте код доступа:",
             reply_markup=get_start_unauth_keyboard()
         )
         await state.set_state(UserStates.waiting_for_code)
@@ -237,9 +222,7 @@ async def process_access_code(message: Message, state: FSMContext):
             await message.answer("⚠️ Этот код уже был использован ранее.", reply_markup=get_start_unauth_keyboard())
             return
 
-        # Помечаем ключ как использованный
         await db.execute("UPDATE access_keys SET is_used = 1 WHERE key_code = ?", (code,))
-        # Авторизуем пользователя
         await db.execute("UPDATE users SET is_authorized = 1 WHERE user_id = ?", (message.from_user.id,))
         await db.commit()
 
@@ -275,7 +258,7 @@ async def cancel_exit(callback: CallbackQuery):
     await callback.answer()
 
 # ==========================================
-# 7. УПРАВЛЕНИЕ ЧАТАМИ И ИСТОРИЕЙ (БЕЗ ПАМЯТИ МЕЖДУ СТАРЫМИ ЧАТАМИ)
+# 7. УПРАВЛЕНИЕ ЧАТАМИ
 # ==========================================
 
 async def create_new_chat(user_id: int, first_message_text: str) -> int:
@@ -318,7 +301,6 @@ async def open_specific_chat(callback: CallbackQuery, state: FSMContext):
     chat_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
 
-    # Проверяем принадлежность чата
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id, title FROM chats WHERE chat_id = ?", (chat_id,)) as cursor:
             chat_row = await cursor.fetchone()
@@ -331,7 +313,6 @@ async def open_specific_chat(callback: CallbackQuery, state: FSMContext):
         async with db.execute("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY message_id ASC", (chat_id,)) as cursor:
             msgs = await cursor.fetchall()
 
-    # Устанавливаем текущий чат в стейт, но исторически для генерации памяти НЕ используем (строго по ТЗ: памяти к старым чатам нет)
     await state.update_data(current_chat_id=chat_id)
 
     response_text = f"📂 **Чат: {chat_title}**\n\n"
@@ -346,7 +327,7 @@ async def open_specific_chat(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 # ==========================================
-# 8. ПАНЕЛЬ АДМИНИСТРАТОРА (ФУНКЦИОНАЛ)
+# 8. ПАНЕЛЬ АДМИНИСТРАТОРА
 # ==========================================
 
 @dp.message(Command("admin"))
@@ -378,9 +359,6 @@ async def admin_activity(callback: CallbackQuery):
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
-            U.user_id, U.username, A.requests_count, A.photo_count, A.ai_type 
-            FROM users U JOIN activity A ON U.user_id = A.user_id
-        """) if False else db.execute("""
             SELECT u.user_id, u.username, a.requests_count, a.photo_count, a.ai_type 
             FROM users u JOIN activity a ON u.user_id = a.user_id
         """) as cursor:
@@ -420,7 +398,6 @@ async def cmd_delete_user(message: Message):
         await db.execute("UPDATE users SET is_authorized = 0 WHERE user_id = ?", (target_id,))
         await db.commit()
 
-    # Принудительно сбрасываем стейт и шлем уведомление пользователю
     try:
         await bot.send_message(target_id, "⚠️ Ваша сессия была завершена администратором.")
     except Exception:
@@ -444,17 +421,10 @@ async def process_broadcast(message: Message, state: FSMContext):
     text_to_send = message.text
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
-            users = await db.fetchall() if hasattr(db, 'fetchall') else await cursor.fetchall()
-            # Исправление выборки
-            rows = await cursor.fetchall() if not users else users
-
-    success = 0
-    # Получаем заново список чисто через execute
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM users") as cursor:
             all_users = [row[0] for row in await cursor.fetchall()]
 
-    status_msg = await message.answer("⏳ Рассылка запущенна...")
+    status_msg = await message.answer("⏳ Рассылка запущена...")
+    success = 0
     for uid in all_users:
         try:
             await bot.send_message(uid, text_to_send)
@@ -474,18 +444,10 @@ async def process_broadcast(message: Message, state: FSMContext):
 async def handle_chat_message(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
-    # Проверка авторизации
     if str(user_id) != ADMIN_ID and not await is_user_authorized(user_id):
         await message.answer("❌ Ваша сессия завершена или не авторизована.")
         await state.set_state(UserStates.waiting_for_code)
         return
-
-    # Проверка лимитов запросов (анти-спам)
-    # Упрощенная проверка через подсчет в базе или простая задержка
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT requests_count FROM activity WHERE user_id = ?", (user_id,)) as cursor:
-            res = await cursor.fetchone()
-            reqs = res[0] if res else 0
 
     if not client:
         await message.answer("❌ Ошибка хостинга: API-ключ не настроен.")
@@ -494,12 +456,10 @@ async def handle_chat_message(message: Message, state: FSMContext):
     data = await state.get_data()
     current_chat_id = data.get("current_chat_id")
 
-    # Если чат еще не выбран, создаем новый автоматически
     if not current_chat_id:
         current_chat_id = await create_new_chat(user_id, message.text)
         await state.update_data(current_chat_id=current_chat_id)
 
-    # Сохраняем сообщение пользователя в БД чата
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, 'user', ?)", (current_chat_id, message.text))
         await db.commit()
@@ -507,26 +467,28 @@ async def handle_chat_message(message: Message, state: FSMContext):
     await bot.send_chat_action(chat_id=user_id, action="typing")
 
     try:
-        # ЗАПРОС К GEMINI 1.5 (Без памяти к старым чатам, контекст только текущего чата)
+        # Достаем историю текущего чата для отправки в Gemini
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY message_id ASC", (current_chat_id,)) as cursor:
                 chat_history_rows = await cursor.fetchall()
 
-        # Формируем содержимое для Gemini 1.5
-        contents = [
-            genai_types.ContentDict(role=r, parts=[c]) for r, c in chat_history_rows
-        ]
+        # Корректное формирование истории без ошибок pydantic
+        formatted_contents = []
+        for role, content in chat_history_rows:
+            # Превращаем 'model' в 'model', а 'user' в 'user' для API
+            formatted_contents.append({
+                "role": role,
+                "parts": [{"text": content}]
+            })
 
         response = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=contents,
+            contents=message.text if len(formatted_contents) <= 1 else formatted_contents,
         )
         ai_reply = response.text
 
-        # Сохраняем ответ модели в БД чата
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, 'model', ?)", (current_chat_id, ai_reply))
-            # Увеличиваем счетчик запросов
             await db.execute("UPDATE activity SET requests_count = requests_count + 1 WHERE user_id = ?", (user_id,))
             await db.commit()
 
